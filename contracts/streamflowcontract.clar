@@ -240,3 +240,126 @@
     (ok true)
   )
 )
+
+
+;; read only functions
+
+;; Get stream details
+(define-read-only (get-stream (stream-id uint))
+  (map-get? streams stream-id)
+)
+
+;; Calculate claimable amount for a stream
+(define-read-only (get-claimable-amount (stream-id uint))
+  (let 
+    (
+      (stream-data (unwrap! (map-get? streams stream-id) ERR_NOT_FOUND))
+      (current-time (get-current-time))
+      (effective-current-time (if (get paused stream-data) (get pause-time stream-data) current-time))
+      (adjusted-current-time (- effective-current-time (get total-paused-duration stream-data)))
+      (stream-end-time (get end-time stream-data))
+      (cliff-time (get cliff-time stream-data))
+    )
+    ;; Check if cliff period has passed
+    (if (< current-time cliff-time)
+      (ok u0)
+      (let 
+        (
+          (elapsed-time (if (> adjusted-current-time stream-end-time) 
+                           (- stream-end-time (get start-time stream-data))
+                           (- adjusted-current-time (get start-time stream-data))))
+          (btc-earned (* (get btc-rate-per-second stream-data) elapsed-time))
+          (stx-earned (try! (convert-btc-to-stx btc-earned)))
+          (max-claimable (get total-deposited stream-data))
+          (already-claimed (get total-claimed stream-data))
+          (claimable (if (> stx-earned max-claimable) max-claimable stx-earned))
+        )
+        (ok (if (> claimable already-claimed) (- claimable already-claimed) u0))
+      )
+    )
+  )
+)
+
+;; Get remaining balance in stream
+(define-read-only (get-remaining-balance (stream-id uint))
+  (let 
+    (
+      (stream-data (unwrap! (map-get? streams stream-id) ERR_NOT_FOUND))
+      (total-deposited (get total-deposited stream-data))
+      (total-claimed (get total-claimed stream-data))
+      (claimable (unwrap! (get-claimable-amount stream-id) ERR_INVALID_AMOUNT))
+    )
+    (ok (- total-deposited (+ total-claimed claimable)))
+  )
+)
+
+;; Convert BTC amount to STX using current rate
+(define-read-only (convert-btc-to-stx (btc-amount uint))
+  (let ((stx-rate (var-get btc-stx-rate)))
+    (if (is-eq stx-rate u0)
+      ERR_ORACLE_ERROR
+      (ok (/ (* btc-amount stx-rate) u100000000)) ;; Convert satoshis to BTC, then to STX
+    )
+  )
+)
+
+;; Get user's streams
+(define-read-only (get-user-streams (user principal))
+  (default-to (list) (map-get? user-streams user))
+)
+
+;; Get recipient's streams
+(define-read-only (get-recipient-streams (recipient principal))
+  (default-to (list) (map-get? recipient-streams recipient))
+)
+
+;; Get stream ID from NFT ID
+(define-read-only (get-stream-from-nft (nft-id uint))
+  (map-get? stream-nft-mapping nft-id)
+)
+
+;; Get current BTC/STX rate
+(define-read-only (get-btc-rate)
+  (var-get btc-stx-rate)
+)
+
+;; Get contract status
+(define-read-only (get-contract-status)
+  {
+    paused: (var-get contract-paused),
+    next-stream-id: (var-get next-stream-id),
+    next-nft-id: (var-get next-nft-id),
+    btc-rate: (var-get btc-stx-rate),
+    oracle-last-update: (var-get oracle-last-update)
+  }
+)
+
+;; NFT functions for composability
+(define-read-only (get-last-token-id)
+  (ok (- (var-get next-nft-id) u1))
+)
+
+(define-read-only (get-token-uri (nft-id uint))
+  (ok (some "https://streamflow.btc/metadata/"))
+)
+
+(define-read-only (get-owner (nft-id uint))
+  (ok (nft-get-owner? stream-nft nft-id))
+)
+
+;; private functions
+
+;; Get current block time (approximation)
+(define-private (get-current-time)
+  (* stacks-block-height SECONDS_PER_BLOCK)
+)
+
+;; Validate stream parameters
+(define-private (validate-stream-params (btc-rate uint) (duration uint) (cliff uint))
+  (and 
+    (> btc-rate u0)
+    (> duration u0)
+    (<= duration MAX_STREAM_DURATION)
+    (<= cliff duration)
+  )
+)
