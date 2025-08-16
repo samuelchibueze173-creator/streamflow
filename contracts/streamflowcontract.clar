@@ -346,3 +346,20 @@
 (define-read-only (get-owner (nft-id uint))
   (ok (nft-get-owner? stream-nft nft-id))
 )
+
+;; private functions
+
+;; Get current block time (approximation)
+(define-private (get-current-time)
+  (* stacks-block-height SECONDS_PER_BLOCK)
+)
+
+;; Validate stream parameters
+(define-private (validate-stream-params (btc-rate uint) (duration uint) (cliff uint))
+  (and 
+    (> btc-rate u0)
+    (> duration u0)
+    (<= duration MAX_STREAM_DURATION)
+    (<= cliff duration)
+  )
+)
