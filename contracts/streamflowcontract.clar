@@ -85,6 +85,13 @@
 (define-map user-last-action principal uint) ;; Rate limiting for user actions
 (define-map emergency-withdrawals principal uint) ;; Emergency withdrawal requests
 (define-map authorized-oracles principal bool) ;; Authorized oracle addresses
+(define-map stream-templates uint { name: (string-ascii 64), btc-rate: uint, duration: uint, cliff: uint, active: bool }) ;; Reusable stream templates
+(define-map stream-milestones { stream-id: uint, milestone-id: uint } { amount: uint, description: (string-ascii 128), reached: bool, timestamp: uint })
+(define-map stream-analytics uint { total-claimed-count: uint, total-paused-count: uint, last-claim-time: uint, avg-claim-amount: uint })
+(define-map user-analytics principal { total-streams-created: uint, total-streams-received: uint, total-stx-streamed: uint, total-stx-received: uint })
+(define-data-var next-template-id uint u1)
+(define-data-var total-volume-streamed uint u0)
+(define-data-var total-streams-created uint u0)
 
 
 ;; security helper functions
@@ -243,6 +250,11 @@
       (var-set next-stream-id (try! (safe-add stream-id u1)))
       (var-set next-nft-id (try! (safe-add nft-id u1)))
       
+      ;; Update analytics
+      (update-user-analytics-deposit tx-sender stx-deposit)
+      (var-set total-volume-streamed (try! (safe-add (var-get total-volume-streamed) stx-deposit)))
+      (var-set total-streams-created (try! (safe-add (var-get total-streams-created) u1)))
+      
       ;; Release reentrancy lock
       (release-reentrancy)
       
@@ -277,6 +289,9 @@
         
         ;; Transfer STX to recipient
         (try! (as-contract (stx-transfer? claimable-amount tx-sender (get recipient stream-data))))
+        
+        ;; Update analytics
+        (update-user-analytics-claim tx-sender claimable-amount)
         
         ;; Release reentrancy lock
         (release-reentrancy)
@@ -475,6 +490,131 @@
   )
 )
 
+;; NEW FUNCTIONALITY: Create stream template (only owner)
+(define-public (create-stream-template (name (string-ascii 64)) (btc-rate uint) (duration uint) (cliff uint))
+  (let ((template-id (var-get next-template-id)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (validate-stream-params btc-rate duration cliff) ERR_INVALID_PARAMS)
+    (asserts! (> (len name) u0) ERR_INVALID_PARAMS)
+    
+    (map-set stream-templates template-id {
+      name: name,
+      btc-rate: btc-rate,
+      duration: duration,
+      cliff: cliff,
+      active: true
+    })
+    
+    (var-set next-template-id (try! (safe-add template-id u1)))
+    (ok template-id)
+  )
+)
+
+;; NEW FUNCTIONALITY: Create stream from template
+(define-public (create-stream-from-template (template-id uint) (recipient principal) (stx-deposit uint))
+  (let ((template (unwrap! (map-get? stream-templates template-id) ERR_NOT_FOUND)))
+    (asserts! (get active template) ERR_INVALID_PARAMS)
+    (create-stream 
+      recipient
+      (get btc-rate template)
+      (get duration template)
+      (get cliff template)
+      stx-deposit
+    )
+  )
+)
+
+;; NEW FUNCTIONALITY: Batch create streams
+(define-public (batch-create-streams 
+    (recipients (list 10 principal))
+    (btc-rates (list 10 uint))
+    (durations (list 10 uint))
+    (cliff-durations (list 10 uint))
+    (stx-deposits (list 10 uint)))
+  (begin
+    (asserts! (is-eq (len recipients) (len btc-rates)) ERR_INVALID_PARAMS)
+    (asserts! (is-eq (len recipients) (len durations)) ERR_INVALID_PARAMS)
+    (asserts! (is-eq (len recipients) (len cliff-durations)) ERR_INVALID_PARAMS)
+    (asserts! (is-eq (len recipients) (len stx-deposits)) ERR_INVALID_PARAMS)
+    
+    (ok (fold batch-create-stream-helper 
+      (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+      { 
+        recipients: recipients,
+        btc-rates: btc-rates,
+        durations: durations,
+        cliffs: cliff-durations,
+        deposits: stx-deposits,
+        results: (list)
+      }
+    ))
+  )
+)
+
+;; NEW FUNCTIONALITY: Add milestone to stream (only sender)
+(define-public (add-stream-milestone (stream-id uint) (milestone-id uint) (amount uint) (description (string-ascii 128)))
+  (let ((stream-data (unwrap! (map-get? streams stream-id) ERR_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get sender stream-data)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len description) u0) ERR_INVALID_PARAMS)
+    
+    (map-set stream-milestones { stream-id: stream-id, milestone-id: milestone-id } {
+      amount: amount,
+      description: description,
+      reached: false,
+      timestamp: u0
+    })
+    (ok true)
+  )
+)
+
+;; NEW FUNCTIONALITY: Mark milestone as reached (only recipient)
+(define-public (mark-milestone-reached (stream-id uint) (milestone-id uint))
+  (let (
+    (stream-data (unwrap! (map-get? streams stream-id) ERR_NOT_FOUND))
+    (milestone (unwrap! (map-get? stream-milestones { stream-id: stream-id, milestone-id: milestone-id }) ERR_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get recipient stream-data)) ERR_UNAUTHORIZED)
+    (asserts! (not (get reached milestone)) ERR_ALREADY_CLAIMED)
+    
+    (map-set stream-milestones { stream-id: stream-id, milestone-id: milestone-id }
+      (merge milestone { reached: true, timestamp: (get-current-time) }))
+    (ok true)
+  )
+)
+
+;; NEW FUNCTIONALITY: Batch claim streams
+(define-public (batch-claim-streams (stream-ids (list 10 uint)))
+  (ok (map claim-stream-helper stream-ids))
+)
+
+;; NEW FUNCTIONALITY: Top up stream (add more funds)
+(define-public (top-up-stream (stream-id uint) (additional-stx uint))
+  (begin
+    (try! (check-reentrancy))
+    (let ((stream-data (unwrap! (map-get? streams stream-id) ERR_NOT_FOUND)))
+      (asserts! (is-eq tx-sender (get sender stream-data)) ERR_UNAUTHORIZED)
+      (asserts! (get active stream-data) ERR_STREAM_ENDED)
+      (asserts! (> additional-stx u0) ERR_INVALID_AMOUNT)
+      
+      ;; Transfer additional STX
+      (try! (stx-transfer? additional-stx tx-sender (as-contract tx-sender)))
+      
+      ;; Update stream with new total
+      (let ((new-total (try! (safe-add (get total-deposited stream-data) additional-stx))))
+        (map-set streams stream-id (merge stream-data { total-deposited: new-total }))
+        
+        ;; Update analytics
+        (update-user-analytics-deposit tx-sender additional-stx)
+        (var-set total-volume-streamed (try! (safe-add (var-get total-volume-streamed) additional-stx)))
+        
+        (release-reentrancy)
+        (ok new-total)
+      )
+    )
+  )
+)
+
 
 ;; read only functions
 
@@ -595,6 +735,68 @@
   (is-some (map-get? authorized-oracles oracle))
 )
 
+;; NEW: Get stream template
+(define-read-only (get-stream-template (template-id uint))
+  (map-get? stream-templates template-id)
+)
+
+;; NEW: Get all active templates (simplified - returns template IDs)
+(define-read-only (get-active-templates)
+  (ok (var-get next-template-id))
+)
+
+;; NEW: Get stream milestone
+(define-read-only (get-stream-milestone (stream-id uint) (milestone-id uint))
+  (map-get? stream-milestones { stream-id: stream-id, milestone-id: milestone-id })
+)
+
+;; NEW: Get stream analytics
+(define-read-only (get-stream-analytics (stream-id uint))
+  (default-to { total-claimed-count: u0, total-paused-count: u0, last-claim-time: u0, avg-claim-amount: u0 }
+    (map-get? stream-analytics stream-id))
+)
+
+;; NEW: Get user analytics
+(define-read-only (get-user-analytics (user principal))
+  (default-to { total-streams-created: u0, total-streams-received: u0, total-stx-streamed: u0, total-stx-received: u0 }
+    (map-get? user-analytics user))
+)
+
+;; NEW: Get global analytics
+(define-read-only (get-global-analytics)
+  {
+    total-volume-streamed: (var-get total-volume-streamed),
+    total-streams-created: (var-get total-streams-created),
+    total-templates: (- (var-get next-template-id) u1),
+    btc-stx-rate: (var-get btc-stx-rate)
+  }
+)
+
+;; OPTIMIZED: Get multiple streams at once
+(define-read-only (get-streams-batch (stream-ids (list 20 uint)))
+  (ok (map get-stream-safe stream-ids))
+)
+
+;; Helper for batch get
+(define-private (get-stream-safe (stream-id uint))
+  (default-to 
+    { sender: CONTRACT_OWNER, recipient: CONTRACT_OWNER, btc-rate-per-second: u0, start-time: u0, end-time: u0, cliff-time: u0, total-deposited: u0, total-claimed: u0, paused: false, pause-time: u0, total-paused-duration: u0, active: false }
+    (map-get? streams stream-id))
+)
+
+;; OPTIMIZED: Calculate multiple claimable amounts at once
+(define-read-only (get-claimable-amounts-batch (stream-ids (list 20 uint)))
+  (ok (map get-claimable-safe stream-ids))
+)
+
+;; Helper for batch claimable calculation
+(define-private (get-claimable-safe (stream-id uint))
+  (match (get-claimable-amount stream-id)
+    success success
+    error u0
+  )
+)
+
 ;; NFT functions for composability
 (define-read-only (get-last-token-id)
   (ok (- (var-get next-nft-id) u1))
@@ -622,5 +824,49 @@
     (> duration u0)
     (<= duration MAX_STREAM_DURATION)
     (<= cliff duration)
+  )
+)
+
+;; Helper for batch create streams
+(define-private (batch-create-stream-helper (index uint) (data { recipients: (list 10 principal), btc-rates: (list 10 uint), durations: (list 10 uint), cliffs: (list 10 uint), deposits: (list 10 uint), results: (list 10 uint) }))
+  (let (
+    (recipient (unwrap-panic (element-at (get recipients data) index)))
+    (btc-rate (unwrap-panic (element-at (get btc-rates data) index)))
+    (duration (unwrap-panic (element-at (get durations data) index)))
+    (cliff (unwrap-panic (element-at (get cliffs data) index)))
+    (deposit (unwrap-panic (element-at (get deposits data) index)))
+  )
+    (match (create-stream recipient btc-rate duration cliff deposit)
+      success (merge data { results: (unwrap-panic (as-max-len? (append (get results data) success) u10)) })
+      error data
+    )
+  )
+)
+
+;; Helper for batch claim
+(define-private (claim-stream-helper (stream-id uint))
+  (match (claim-stream stream-id)
+    success success
+    error u0
+  )
+)
+
+;; Update user analytics on deposit
+(define-private (update-user-analytics-deposit (user principal) (amount uint))
+  (let ((analytics (default-to { total-streams-created: u0, total-streams-received: u0, total-stx-streamed: u0, total-stx-received: u0 } (map-get? user-analytics user))))
+    (map-set user-analytics user (merge analytics {
+      total-streams-created: (+ (get total-streams-created analytics) u1),
+      total-stx-streamed: (+ (get total-stx-streamed analytics) amount)
+    }))
+  )
+)
+
+;; Update user analytics on claim
+(define-private (update-user-analytics-claim (user principal) (amount uint))
+  (let ((analytics (default-to { total-streams-created: u0, total-streams-received: u0, total-stx-streamed: u0, total-stx-received: u0 } (map-get? user-analytics user))))
+    (map-set user-analytics user (merge analytics {
+      total-streams-received: (+ (get total-streams-received analytics) u1),
+      total-stx-received: (+ (get total-stx-received analytics) amount)
+    }))
   )
 )
